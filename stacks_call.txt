@@ -1,0 +1,4 @@
+denovo_map.pl -o ./denovo_map/unfiltered_snps -T 16 -O stacks_popmap.txt --samples ./ \
+-X "populations:--fstats" -X "populations:--log_fst_comp" \
+-X "populations:--vcf" -X "populations:--plink" -X "populations:--genepop" \
+-m 3 -M 7 -n 6 -S -b 1
