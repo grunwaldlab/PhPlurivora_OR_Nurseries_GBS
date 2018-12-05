@@ -1,0 +1,733 @@
+---
+title: "Publication Figures"
+author: "Nick Carleson"
+date: "December 5, 2018"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Prepare environment and files
+
+### Load libraries
+
+First we load the R packages necessary for analysis.
+
+```{r load_libraries}
+# input/output
+library(readxl)
+library(vcfR)
+
+# pop/gen
+library(ape)
+library(adegenet)
+library(pegas)
+library(phangorn)
+library(poppr)
+library(hierfstat)
+
+# graphing and dataviz
+library(igraph)
+library(tidyverse)
+library(reshape2)
+library(ggrepel)
+```
+
+### Load data
+
+Now we will load the data. This consists of 1) SNP data (from the VCF) and 2) metadata about each sample
+
+1)
+
+```{r load_vcf, echo=FALSE}
+vcf_file <- "data/unfiltered_snps.vcf.gz"
+vcf <- read.vcfR(vcf_file)
+
+# Set data to missing if the coverage is 0 at any position or the genotype (GT) is missing
+vcf_0toMissing <- vcf
+dp <- extract.gt(vcf_0toMissing, element = "DP", as.numeric = TRUE)
+dp[dp == 0] <- NA
+vcf_0toMissing@gt[,-1][ is.na(dp) == TRUE] <- NA
+gt <- extract.gt(vcf_0toMissing, element = "GT")
+vcf_0toMissing@gt[,-1][ is.na(gt) == TRUE] <- NA
+```
+
+2)
+
+```{r load_metadata}
+metadata_file <- "data/metadata.csv"
+strata_defs <- read.table(metadata_file,
+                          sep = ",", header = TRUE, stringsAsFactors = FALSE)
+```
+
+## VCF filtering
+
+The raw data from STACKS is not good enough to analyze. We will filter on various measures of quality. I'll wrap these into functions and call them later. These functions have default values, but they should be specified and messed around with because each dataset is unique.
+
+```{r filter_func}
+# first filter by depth and quantity of missing data
+filter_vcf <- function (x, min_depth = 4, samples_miss1 = 1.0, samples_miss2 = 0.7, vars_miss = 0.2, top_95_quantile_filter = TRUE, remove_nonpolymorphs = TRUE, max_depth = 800) {
+  dp <- extract.gt(x, element = "DP", as.numeric = TRUE)
+  
+  # Censor variants depth < 8 or > 100
+  dp[dp < min_depth] <- NA
+  dp[dp > max_depth] <- NA
+  x.2 <- x
+  x.2@gt[,-1][ is.na(dp) == TRUE] <- NA
+  
+  # Censor variants in top 95% quantile
+  if (top_95_quantile_filter == TRUE) {
+    dp <- extract.gt(x.2, element = "DP", as.numeric = TRUE)
+    quants <- apply(dp, MARGIN=2, quantile, probs=c(0.05, 0.95), na.rm=TRUE)
+    # Sweep up the file to get rid of the quartiles
+    dp2 <- sweep(dp, MARGIN=2, FUN="-", quants[1,])
+    dp[dp2 < 0] <- NA
+    dp2 <- sweep(dp, MARGIN=2, FUN="-", quants[2,])
+    dp[dp2 > 0] <- NA
+    x.3 <- x.2
+    x.3@gt[,-1][ is.na(dp) == TRUE] <- NA
+  }
+  
+  # Omit samples with >90% missingness
+  dp <- extract.gt(x.3, element = "DP", as.numeric = TRUE)
+  # Now omitting samples
+  myMiss <- apply(dp, MARGIN = 2, function(y){ sum( is.na(y) ) } )
+  myMiss <- myMiss / nrow(dp)
+  x.4 <- x.3
+  x.4@gt <- x.4@gt[, c(TRUE, myMiss < samples_miss1)]
+  
+  # Omit variants with >5% missingness
+  dp <- extract.gt(x.4, element = "DP", as.numeric = TRUE)
+  # Now omitting vars
+  myMiss <- apply(dp, MARGIN = 1, function(y) {sum(is.na(y))})
+  myMiss <- myMiss / ncol(dp)
+  x.5 <- x.4
+  x.5 <- x.5[myMiss < vars_miss, ]
+  
+  # Omit samples with >5% missingness
+  dp <- extract.gt(x.5, element = "DP", as.numeric = TRUE)
+  # Omit samples
+  myMiss <- apply(dp, MARGIN = 2, function(y) {sum(is.na(y))})
+  myMiss <- myMiss / nrow(dp)
+  x.6 <- x.5
+  x.6@gt <- x.6@gt[, c(TRUE, myMiss < samples_miss2)]
+  
+  # Now remove all variants that are no longer present
+  # Measured by a minor allele count > 0
+  if (remove_nonpolymorphs == FALSE) {
+    return(x.6)
+  } else {
+    x.7 <- x.6
+    x.7 <- x.7[is.polymorphic(x.7, na.omit = TRUE)]
+    return(x.7)
+  }
+}
+
+# Now filter based on minor allele frequency (MAF)
+missingGT_maf_filter <- function(x, min_count = 2, isGTmissing = TRUE) {
+  maf_matr <- vcfR::maf(x)
+  maf_df <- data.frame(maf_matr)
+  countslot <- maf_df$Count
+  names(countslot) <- rownames(maf_df)
+  
+  # subsetting using count column of maf call
+  x_mincount <- x
+  x_mincount <- x_mincount[(countslot >= min_count),]
+
+  # return end VCF if want to get rid of all NA genotypes
+  if (isGTmissing == TRUE) {
+    maf <- vcfR::maf(x_mincount)
+    maf_df <- data.frame(maf)
+    naslot <- maf_df$NA.
+    x_nomissing <- x_mincount
+    x_nomissing <- x_nomissing[(naslot == 0),]
+    return(x_mincount[(naslot == 0),])
+  }
+  else {
+    return(x_mincount)
+  }
+}
+```
+
+### Variant and sample censorship and omission
+
+Now we will call these filtering functions on our data, resulting in a "production VCF" that can be written to a file and reloaded elsewhere to reproduce the figures as shown in the manuscript.
+
+Here are the steps I used for filtering, reflecting the code from the functions above: 
+
+1. Censor any allele call with a depth of coverage of 4 or less. In other words, any allele with fewer than 5 reads supporting the call is converted to missing data (NA).
+2. Censor SNPs with depth values in the top 95th quantile and the bottom 5th quantile.
+3. Omit samples composed of greater than 99.5% missing data across all variants.
+4. Omit variants with more than 5% of alleles missing across all samples.
+5. Finally, keep only samples having 90% or more of their allele calls.
+6. Remove all variants that are not polymorphic i.e., have no allele calls in any of the samples. This is just housekeeping to ensure the SNP count is not falsely inflated.
+
+```{r filter_vcf_call}
+dp5 <- filter_vcf(vcf_0toMissing, min_depth = 5, samples_miss1 = .995, samples_miss2 = 0.10, vars_miss = 0.05, T, T)
+dp5
+```
+
+Then in the MAF filtering step:
+
+1. Any variant with a minor allele count of only 1 is removed.
+2. Any variant with any mising data is removed.
+
+```{r maf_filter}
+vcf_maffed <- missingGT_maf_filter(dp5, min_count = 2, isGTmissing = TRUE)
+vcf_maffed
+```
+
+### File conversion
+
+Now we will save our final VCF, with all these filtering steps done to it, and convert it into the file formats we will use for pop gen analysis.
+
+First define the functions we need for these steps.
+
+```{r write_save_steps}
+# Filter strata using the strata set to convert names at the beginning
+filter_apply_strata <- function(x, strata_defs, gl = FALSE) {
+  strata_defs_filtered <- subset(strata_defs[,], strata_defs$Sample %in% rownames(x@tab))
+  return(strata_defs_filtered)
+}
+```
+
+Now prepare vcfR object for pop gen analysis.
+
+```{r popgen_prep}
+# remove three isolates that were collected from same plant
+remove_sampleIDs <- c("B-2", "B-4", "B-5")
+vcf_maffed <- vcf_maffed[, !(colnames(vcf_maffed@gt) %in% remove_sampleIDs)]
+
+# convert from vcfR to genind/genlight objects
+test1_gi <- vcfR2genind(vcf_maffed)
+test1_gl <- vcfR2genlight(vcf_maffed)
+
+# default ploidy for plurivora
+ploids <- 2
+
+# filter the strata to the right size and apply to the objects.
+strata(test1_gi) <- filter_apply_strata(test1_gi, strata_defs)
+pop(test1_gl) <- strata(test1_gl)$Nursery
+ploidy(test1_gl) <- ploids
+
+# remove technical reps
+no_reps_gi <- test1_gi
+no_reps_gi <- no_reps_gi[!is.na(strata(no_reps_gi)$Keep) , ]
+
+test1_gc <- as.genclone(test1_gi)
+no_reps_gc <- as.genclone(no_reps_gi)
+
+# make vcfR objects only containing these sample sets
+no_reps_vcf <- vcf_maffed
+no_reps_vcf@gt <- vcf_maffed@gt[, c(TRUE, colnames(vcf_maffed@gt)[-1] %in% rownames(no_reps_gc@tab) )]
+no_reps_cc_vcf <- vcf_maffed
+no_reps_cc_vcf@gt <- vcf_maffed@gt[, c(TRUE, colnames(vcf_maffed@gt)[-1] %in% rownames(clonecorrect(no_reps_gc, ~Nursery)@tab))]
+```
+
+## Population genetics
+
+### Principal component analysis
+
+#### Figure 1
+
+```{r pca_vis_final, height = 3.25, width = 3.25}
+n_dims <- 4
+pca1 <- glPca(test1_gl, nf = n_dims)
+iPst.pca.scores <- as.data.frame(pca1$scores)
+iPst.pca.scores$pop <- pop(test1_gl)
+iPst.pca.scores$sample <- rownames(iPst.pca.scores)
+
+# subset PCA to have no technical reps
+iPst.pca.scores <- iPst.pca.scores[test1_gl@ind.names %in% rownames(no_reps_gc@tab),]
+iPst.pca.scores$pop <- no_reps_gc$strata$Nursery
+
+# these are the diverse samples (observed and noted from the NJ tree)
+cluster2_samples <- c('H-1', 'H-2_1', 'H-2_2', 'H-3', 'H-6_1', 'H-6_2', 'H-8_1', 'H-8_2',
+              'H-10', 'H-14', 'H-15', 'C-8')
+# separate the clade of cryptic diversity ('diverse') and clone
+# to later add separate geom_points for clone (jittered) and non-clone (non-jittered)
+iPst.pca.scores.diverse <- iPst.pca.scores[(iPst.pca.scores$sample %in% cluster2_samples),]
+iPst.pca.scores.clone <- iPst.pca.scores[!(iPst.pca.scores$sample %in% cluster2_samples),]
+
+# fix labels for each set
+# Get rid of tech rep labels - this is technical-replicate-agnostic
+iPst.pca.scores.diverse$sample <- gsub("_[0-9]", "", iPst.pca.scores.diverse$sample)
+# pop(iPst.pca.scores.diverse)
+# If a sample is NOT diverse, do NOT label it. NA gives a warning, blank text does not
+iPst.pca.scores.clone$sample <- ""
+# but come up with a label for the clone along with coordinates to plot the label
+clone_label <- data.frame(sample = "Clone",
+                          PC1 = median(iPst.pca.scores.clone$PC1),
+                          PC2 = median(iPst.pca.scores.clone$PC2))
+  
+# calculate percent variance explained by first two eigenvalues
+pc1_eig <- round(pca1$eig[1]/sum(pca1$eig), digits = 3)
+pc2_eig <- round(pca1$eig[2]/sum(pca1$eig), digits = 3)
+
+# now plot PCA scatter plot
+p12 <- ggplot(data = iPst.pca.scores.diverse)
+p12 <- p12 + geom_hline(yintercept = 0) 
+p12 <- p12 + geom_vline(xintercept = 0)
+p12 <- p12 + geom_point(data = iPst.pca.scores.diverse, size=4.5, stroke = 0.69, alpha = 0.45, colour = "black",
+                        aes(x = PC1, y=PC2, fill= pop, shape = pop))
+p12 <- p12 + geom_point(data = iPst.pca.scores.clone, size=4.5, stroke = 0.69, alpha = 0.05, colour = "black",
+                        aes(x = PC1, y=PC2, fill= pop, shape = pop))
+p12 <- p12 + scale_shape_manual(values = c(22, 23, 21, 24), name = "Nursery")
+p12 <- p12 + scale_fill_manual(values = spectral(length(levels(iPst.pca.scores$pop))), name = "Nursery") 
+adj_element_text = (5/14)
+y_limits <- c(0.1, -6.5)
+x_limits <- c(-0.1, 15.1)
+p12 <- p12 + geom_label_repel(data = iPst.pca.scores.diverse, aes(label=sample, x = PC1, y = PC2),
+                             alpha = 0.75, size = 10*adj_element_text, point.padding = 0.75,
+                             force = 3, show.legend = FALSE, min.segment.length = 0.25, box.padding = unit(0.1, "lines"),
+                             xlim = x_limits, ylim = y_limits, 
+                             seed = 56)
+p12 <- p12 + theme_bw()
+p12 <- p12 + theme(plot.title = element_blank(),
+                   axis.text = element_text(size = 9),
+                   axis.title = element_text(size = 12),
+                   panel.grid.minor = element_blank(),
+                   legend.text = element_text(size = 12),
+                   legend.position = "bottom",
+                   legend.margin = margin(0,0,0,0),
+                   legend.box.margin = margin(0,0,0,0),
+                   plot.margin = margin(0, 6, 0, 1))
+p12 <- p12 + labs(x = paste("PC1 (", pc1_eig*100, "%)", sep = ""),
+                  y = paste("PC2 (", pc2_eig*100, "%)", sep = ""))
+p12 <- p12 + geom_label_repel(data = clone_label,
+                        aes(x = PC1, y = PC2,
+                            label = paste(sample, ", n=", nrow(iPst.pca.scores.clone), sep = "")),
+                        size = 10*adj_element_text, alpha = 0.75, show.legend = FALSE,
+                        force = 1, point.padding = .75, min.segment.length = .25,
+                        ylim = c(2.5, 1.5), seed = 41) +
+  coord_fixed()
+
+p12 
+ggplot2::ggsave("figures/PCA_pc1_pc2.svg", plot = p12, width = 3.25, height = 2.75, units = "in")
+```
+
+### Minimum spanning network
+
+#### Figure 2
+
+```{r msn_figure}
+# calculate and create MSN object
+setPop(no_reps_gc) <- ~Nursery
+no_reps_gc_sub <- popsub(no_reps_gc, blacklist = character(0))
+no_reps_gc_dist <- diss.dist(no_reps_gc_sub, percent = TRUE, mat = FALSE)
+min_span_net <- poppr.msn(no_reps_gc_sub, no_reps_gc_dist, showplot = FALSE, include.ties = TRUE)
+# calculate edge weight cutoff, emphasizing clone
+min_span_net_dists <- E(min_span_net$graph)$weight
+# a cutoff of the 90th percentile was selected for edges that should be plotted
+cutoff_dist <- quantile(min_span_net_dists, 0.9)
+
+# plot MSN
+svg("figures/msn.svg")
+set.seed(703)
+plot_msn <- plot_poppr_msn(no_reps_gc_sub,
+               min_span_net,
+               inds = "NONE",
+               mlg = FALSE,
+               gadj = 50,
+               gweight = 1,
+               palette = spectral,
+               beforecut=TRUE,
+               cutoff = cutoff_dist,
+               quantiles = FALSE,
+               pop.leg = TRUE,
+               size.leg = TRUE,
+               scale.leg = TRUE,
+               nodelab = 30,
+               layfun = igraph::layout_with_gem,
+               nodescale = 50
+               )
+dev.off()
+```
+
+### Fst
+
+#### Figure 3
+
+Write the function
+
+```{r fst_func}
+fst_workflow <- function(x, formula) {
+  setPop(x) <- formula
+  
+  # Calculate Fst pairwise between samples
+  x.fst <- pairwise.fst(x, res.type = "matrix")
+
+  x.hierfstat <- genind2hierfstat(x)
+  # Calculate basic statistics, other than Fst
+  x.stats <- basic.stats(x.hierfstat)
+  
+  # Show pca plot where each point is one population
+  dist <- genet.dist(x.hierfstat, method = "Cp")
+  biplot(ape::pcoa(as.matrix(dist)), rn = levels(pop(x)))
+  
+  # Calculate pca for each individual sample, color by population
+  x.hierfstat$sample <- rownames(x@tab)
+  some_pca <- indpca(x.hierfstat[,1:ncol(x.hierfstat)-1], ind.labels = x.hierfstat$sample)
+  plot(some_pca, col = as.numeric(x.hierfstat[,1]))
+  
+  # reshape data (tidy/tall form)
+  dat2 <- x.fst %>%
+    as_tibble() %>%
+    rownames_to_column('Var1') %>%
+    gather(Var2, value, -Var1) %>%
+    mutate(
+      Var1 = rep(rownames(x.fst), 4)
+    )
+  return(dat2)  
+  
+  # plot data
+  ggplot(dat2, aes(fct_inorder(Var1), fct_inorder(Var2))) +
+    geom_tile(aes(fill = value)) + 
+    geom_text(aes(label = round(value, 3))) +
+    scale_fill_gradient(low = "white", high = "red")  +
+    xlab("Nursery") +
+    ylab("Nursery") +
+    guides(fill = FALSE)
+}
+
+```
+
+Execute function on our data
+
+```{r exec_fst}
+test1_gc_contractedmlgs <- test1_gc
+mlg.filter(test1_gc_contractedmlgs, distance = "diss.dist", algorithm = "farthest_neighbor") <- 1
+test1_gc_cc <- clonecorrect(test1_gc_contractedmlgs, strata = NA)
+test1_gc_cc_fst <- fst_workflow(test1_gc_cc, ~Nursery)
+# recast fst data into matrix, remove triangle, remelt, then plot
+test1_gc_cc_fst_dcast <- dcast(test1_gc_cc_fst, Var1~Var2)[,-1]
+test1_gc_cc_fst_dcast[lower.tri(test1_gc_cc_fst_dcast)] <- NA
+test1_gc_cc_fst_recast <- as.data.frame(test1_gc_cc_fst_dcast)
+test1_gc_cc_fst_recast$Nursery <- colnames(test1_gc_cc_fst_recast)
+test1_gc_cc_fst_recast <- na.omit(melt(test1_gc_cc_fst_recast, 'Nursery', variable.name = "Nursery2"))
+# plot reformatted data
+test1_gc_cc_fst_ggplot <- ggplot(test1_gc_cc_fst_recast, aes(fct_inorder(Nursery), fct_inorder(Nursery2))) +
+    geom_tile(aes(fill = value)) + 
+    geom_text(aes(label = round(value, 3)), size = 6) +
+    scale_fill_gradient(low = "white", high = "red")  +
+    labs(x = "Nursery", y = "Nursery") +
+    guides(fill = FALSE) +
+    theme()
+ggsave("figures/fst_heatmap.svg", test1_gc_cc_fst_ggplot, units = "in", width = 3.25, height = 2.75)
+```
+
+
+### Depth plots
+
+#### Supplementary Figure 1
+
+Write function
+
+```{r depth_writefunc}
+boxplot_depth_het <- function(x_gl, x_gc, x_vcf, strata) {
+  # this lets us set the pop as the cluster
+  identities <- snapclust(x_gc, 2)
+  geom_identities <- find.clusters(x_gc, choose.n.clust = FALSE, criterion = 'diffNgroup', n.pca = 10)
+  set.seed(105)
+  geom_identities_k2 <- find.clusters(x_gc,  n.clust = 2, max.n.clust = 2, choose.n.clust = FALSE, criterion = 'diffNgroup', n.pca = 10)
+  clustering_membership <- geom_identities_k2$grp
+  strata_defs_filtered <- strata
+  strata_defs_filtered$cluster <- clustering_membership
+  x_gl_popcluster <- x_gl
+  x_gl_poptown <- x_gl
+  pop(x_gl_popcluster) <- strata$cluster
+  pop(x_gl_poptown) <- strata$Nursery
+  
+  # snapclust is very close to genetic distance
+  clusters <- clustering_membership
+  ploids <- ploidy(x_gl_popcluster)
+  # get depth, make data frame for boxplotting these all together
+  dp <- extract.gt(x_vcf, element = "DP", as.numeric = TRUE)
+  myDepth <- apply(dp, MARGIN = 2, function(y){ mean(y, na.rm = TRUE) })
+  
+  mean_dps <- apply(dp, MARGIN = 2, mean, na.rm = TRUE)
+  quants_mean <- quantile(mean_dps, probs=c(0.05, 0.95), na.rm = TRUE)
+  # upper quantile of mean depth
+  bot <- mean_dps[mean_dps < quants_mean[1]]
+  # lower quantile of mean depth
+  top <- mean_dps[mean_dps > quants_mean[2]]
+  
+  # get heterozygosity
+  all_het <- is_het(extract.gt(x_vcf), na_is_false = TRUE)
+  myHet <- colSums(all_het)
+  t_dp <- data.frame(t(dp))
+  t_dp$Sample <- rownames(t_dp)
+  t_dp$Cluster <- clusters
+  t_dp$Ploidy <- ploids
+  t_dp$Heterozygosity <- myHet
+  t_dp$Nursery <- strata_defs_filtered$Nursery
+  
+  Nursery_colors <- c(t_dp$Nursery)
+  names(Nursery_colors) <- Nursery_colors
+  rainbow_pal <- rainbow(4)
+  spectral_pal <- spectral(4)
+  t_dpf <- melt(t_dp, c('Sample', 'Cluster', 'Ploidy', 'Heterozygosity', 'Nursery'), variable.name = "Index", value.name = "Depth")
+  
+  # calculate some more stats
+  mean_dp_1ploidy <- mean(t_dpf$Depth[t_dpf$Ploidy == 1])
+  mean_dp_2ploidy <- mean(t_dpf$Depth[t_dpf$Ploidy == 2])
+  
+  # Sort data frame be samples with highest mean depth
+  t_dpf_sorted <- t_dpf %>%
+    group_by(Sample) %>%
+    summarise(avg = mean(Depth, na.rm = TRUE)) %>%
+    right_join(t_dpf, by = c("Sample")) %>%
+    arrange(desc(avg), desc(Depth)) %>%
+    select(-avg) %>%
+    ungroup
+  # Retrieve the sorted order
+  samples_in_order <- unique(t_dpf_sorted$Sample)
+  samples_in_order_df <- data.frame(samples_in_order)
+  # Add in nurseries as a column in the correct order from the strata definitions
+  samples_in_order_df$Nursery <- strata_defs_filtered[ order(match(strata_defs_filtered$Sample, samples_in_order_df$samples_in_order)),]$Nursery
+  samples_in_order_df$Nursery_color <- NA
+  samples_in_order_df[samples_in_order_df$Nursery == "A",]$Nursery_color <- spectral_pal[1]
+  samples_in_order_df[samples_in_order_df$Nursery == "B",]$Nursery_color <- spectral_pal[2]
+  samples_in_order_df[samples_in_order_df$Nursery == "C",]$Nursery_color <- spectral_pal[3]
+  samples_in_order_df[samples_in_order_df$Nursery == "H",]$Nursery_color <- spectral_pal[4]
+
+  depth_boxplot <- ggplot(t_dpf_sorted, aes(fct_inorder(Sample), Depth, fill = Heterozygosity, color = Cluster)) +
+    geom_boxplot() + 
+    theme_bw() +
+    scale_fill_gradient2(midpoint = quantile(myHet, c(0.05, 0.95), na.rm = TRUE)[2], high = "#018571", mid = "#dcdcdc", low = "#a6611a", name = "Het. Loci") +
+    scale_color_manual(values = c("blue4", "greenyellow"))  +
+    geom_hline(aes(yintercept=mean(t_dpf$Depth, na.rm = TRUE)),
+               color = "springgreen3", linetype="dashed", alpha = 0.75, size = 1) +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1,
+                                     color = samples_in_order_df$Nursery_color),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank()) +
+    labs(x = "")
+  return(depth_boxplot)
+}
+```
+
+Call function. Note that the clusters were selected programatically by Snapclust, which is implemented in Adegenet.
+
+```{r exec_depth}
+strata_defs_filtered <- subset(strata_defs[,], strata_defs$Sample %in% (test1_gl@ind.names))
+depth_plot <- boxplot_depth_het(test1_gl, test1_gc, vcf_maffed, strata_defs_filtered)
+ggsave(filename = "figures/depth_boxplots.png", depth_plot, width = 15, height = 6)
+```
+
+### Phylogenetic tree
+
+#### Supplementary Figure 2
+
+First calculate and prepare the tree
+
+```{r calc_prep_tree}
+set.seed(102)
+geo_tree <- aboot(x = test1_gc, sample = 999, tree = 'nj', missing = "ignore", quiet = TRUE, showtree = FALSE, distance = prevosti.dist, cutoff = 75)
+spectral_pal <- spectral(length(levels(pop(test1_gc))))
+cols <- spectral_pal[pop(test1_gc)]
+```
+
+Now plot the tree
+
+```{r plot_tree}
+svg("figures/nj_phylogeny.svg", width = 10, height = 10)
+
+# prep dataframe that has the info I need
+filtered_gc_info <- data.frame(Sample = strata(test1_gc)$Sample,
+                               Source = strata(test1_gc)$Source,
+                               Nursery = strata(test1_gc)$Nursery,
+                               ITS = strata(test1_gc)$base_ITS_new)
+
+setPop(test1_gc) <- ~Nursery
+spectral_pal <- spectral(length(levels(pop(test1_gc))))
+nursery_cols <- spectral_pal[pop(test1_gc)]
+
+plot.phylo(ladderize(midpoint(geo_tree)), cex = 0.8, font = 2, adj = 0,
+           label.offset = 0.0125, underscore = TRUE, tip.color = nursery_cols,
+           type = "fan", align.tip.label = TRUE, open.angle = 10)
+
+# draw boostraps
+nodelabels(round(geo_tree$node.label, 1),  adj = c(1.3, -0.5),
+           frame = "n", cex = 0.8,font = 3, xpd = TRUE)
+
+# add legend
+legend(-0.2,0.2, legend = levels(pop(test1_gc)), pch = 22, pt.bg = spectral_pal, pt.cex = 2.5, title = "Nursery")
+
+# add scale
+axisPhylo(xaxp= c(2, 9, 7))
+
+# add dimension for collection source
+setPop(test1_gc) <- ~Source
+tip_pal <- virid(length(levels(pop(test1_gc))))
+tip_cols <- tip_pal[pop(test1_gc)]
+tiplabels(frame = "n", cex = 2, font = 3, xpd = NA, offset = 0.09, pch = 19, col = tip_cols)
+legend(-0.05,0.2, legend = levels(pop(test1_gc)), pch = 22, pt.bg = tip_pal, pt.cex = 2.5, title = "Source")
+
+# add factor for allele at SNP in ITS
+setPop(test1_gc) <- ~base_ITS_new
+tip_pal <- funky(length(levels(pop(test1_gc))))
+tip_cols <- tip_pal[pop(test1_gc)]
+tiplabels(frame = "n", cex = 2, font = 3, xpd = NA, offset = 0.12, pch = 19, col = tip_cols)
+legend(0.11,0.2, legend = levels(pop(test1_gc)), pch = 22, pt.bg = tip_pal, pt.cex = 2.5, title = "ITS")
+
+dev.off()
+```
+
+### Population diversity
+
+#### Table 1
+
+```{r div_stats}
+for_div_stats <- poppr(no_reps_gc, strata = ~Nursery)
+for_rbard <- poppr(no_reps_gc, clonecorrect = TRUE, sample = 999, strata = ~Nursery)
+```
+
+### AMOVA
+
+#### Table 2
+
+```{r do_amova}
+amova_noreps_cc_pegas <- poppr.amova(no_reps_gc, hier= ~Nursery, clonecorrect = TRUE, threshold = 1, method = "pegas", nperm = 100)
+amova_diffs <- amova_noreps_cc_pegas$tab
+amova_diffs$pct_variance <- c(amova_noreps_cc_pegas$varcomp[,'sigma2'], NA)
+amova_diffs$p_value <- c(amova_noreps_cc_pegas$varcomp[,'P.value'], NA)
+amova_diffs[c(3, 1, 2, 4, 5)]
+```
+
+## Fungicides
+
+Load in Excel data
+
+```{r load_rawfungdata}
+raw_data <- read.table("data/fungicide_table.tsv", header = TRUE, sep = "\t")
+```
+
+Clean table
+
+```{r clean_fungdata}
+cleaned_data <- raw_data %>%
+  map_dfr(~ gsub("\\*", NA, .x))
+  
+
+colnames(cleaned_data)[6] <- "mef"
+colnames(cleaned_data)[7] <- "phos"
+
+class(cleaned_data$mef) <- "double"
+class(cleaned_data$phos) <- "double"
+class(cleaned_data$Trial) <- "integer"
+
+fung_cleaned_data <- melt(cleaned_data, c('Nursery', 'Species', 'Isolate', 'Trial', 'Rep'),
+                          variable.name = "Fungicide", value.name = "EC50")
+
+fung_cleaned_data_trans <- fung_cleaned_data %>%
+  mutate(log_EC50 = log(EC50)) %>%
+  mutate(log10_EC50 = log10(EC50)) %>%
+  mutate(root_EC50 = sqrt(EC50)) %>%
+  mutate(reciprocal_EC50 = 1/EC50)
+```
+
+Prepare summaries for bar charts, both with raw data and log-transformed data
+
+```{r prepare_graphingdatastates}
+fung_summary_log <- fung_cleaned_data_trans %>%
+  group_by(Isolate, Fungicide) %>%
+  summarize(mean = mean(log_EC50, na.rm = TRUE),
+            median = median(log_EC50, na.rm = TRUE),
+            sd = sd(log_EC50, na.rm = TRUE)) %>%
+  data.frame(stringsAsFactors = FALSE)
+levels(fung_summary_log$Fungicide) <- c("A", "B")
+fung_summary_cast_log <- dcast(fung_summary_log, Isolate ~ Fungicide, value.var = 'mean') %>%
+  map_dfr(~ gsub("NaN", NA, .x))
+fung_summary_cast_log$Nursery <- sapply(strsplit(fung_summary_cast_log$Isolate, "-"), `[`, 1)
+
+fung_summary_raw <- fung_cleaned_data_trans %>%
+  group_by(Isolate, Fungicide) %>%
+  summarize(mean = mean(EC50, na.rm = TRUE),
+            median = median(EC50, na.rm = TRUE),
+            sd = sd(EC50, na.rm = TRUE)) %>%
+  data.frame(stringsAsFactors = FALSE)
+levels(fung_summary_raw$Fungicide) <- c("A", "B")
+fung_summary_raw$Nursery <- sapply(strsplit(fung_summary_raw$Isolate, "-"), `[`, 1)
+fung_summary_cast <- dcast(fung_summary_raw, Isolate ~ Fungicide, value.var = 'mean') %>%
+  map_dfr(~ gsub("NaN", NA, .x))
+fung_summary_cast$Nursery <- sapply(strsplit(fung_summary_cast$Isolate, "-"), `[`, 1)
+```
+
+### Fungicide sensitivity distribution
+
+#### Figure 4
+
+```{r plot_distr}
+fung_distr <- ggplot(fung_summary_raw, aes(mean)) +
+  geom_histogram(aes(fill = Nursery), na.rm = TRUE, binwidth = 0.25,
+                 alpha = 0.75, position = "stack",
+                 color = "black") +
+  scale_fill_manual(values = spectral(4)) +
+  labs(x = expression("EC"[50]*" ("*mu*"g/ml)"), y = "Frequency") +
+  facet_wrap(vars(Fungicide), scales = "free_x") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.margin = margin(5, 23, 5, 5),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        axis.text = element_text(size = 
+                                   10),
+        text = element_text(size = 12),
+        legend.position = "none") +
+  geom_text(data = dplyr::distinct(fung_summary_raw, Fungicide),
+            aes(label = Fungicide),
+            x = Inf, y = Inf, hjust = 5, vjust = 1.2, size = 8) +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 5.5))
+
+fung_distr
+
+ggsave("figures/fung_resist_distr.png", fung_distr,
+       width = 3.25, height = 2.5, units = "in")
+```
+
+### Fungicide sensitivity correlation
+
+#### Figure 5
+
+```{r plot_corr}
+# Spearman's test (R), not Pearson's (r) or R^2
+fung_summary_cast_nona <- fung_summary_cast[!is.na(fung_summary_cast$B),]
+fung_summary_cast_nona$A <- as.numeric(fung_summary_cast_nona$A)
+fung_summary_cast_nona$B <- as.numeric(fung_summary_cast_nona$B)
+range_A <- range(fung_summary_cast_nona$A)
+range_B <- range(fung_summary_cast_nona$B)
+spearmans <- cor.test(fung_summary_cast_nona$A, fung_summary_cast_nona$B, method = "spearman")
+
+fung_cor <- ggplot(fung_summary_cast_nona) +
+  geom_point(aes(x = A, y = B, fill = Nursery, shape = Nursery), na.rm = TRUE,
+             size = 2.5, stroke = 0.69) +
+  scale_fill_manual(values = spectral(4), name = "Nursery") +
+  scale_shape_manual(values = c(22, 23, 21), name = "Nursery") +
+  labs(x = expression("EC"[50]*" ("*mu*"g/ml) of mefenoxam"),
+       y = expression("EC"[50]*" ("*mu*"g/ml) of phosphorous acid")) +
+    # annotate with Spearman's
+  annotate(geom = "text", x = 3, y = 775, label = "R = 0.616") +
+  annotate(geom = "text", x = 3, y = 500, label = "p < 0.010") +
+  theme_bw() +
+  scale_x_continuous(trans = "log10", breaks = c(1, 10, 100, 500), limits = c(0.8, 500)) +
+  scale_y_continuous(trans = "log10", breaks = c(10, 100, 1000), limits = c(4, 1000)) +
+  theme(panel.grid = element_blank(),
+        plot.margin = margin(5, 5, 5, 5),
+        axis.text = element_text(size = 10),
+        text = element_text(size = 12),
+        legend.position = "bottom",
+        legend.box.margin = margin(-10, -10, -5, -10),
+        legend.margin = margin(t = 0, unit = 'cm'))
+
+fung_cor
+
+ggsave("figures/fung_resist_cor.png", fung_cor,
+       width = 3.25, height = 4, units = "in")
+```
+
